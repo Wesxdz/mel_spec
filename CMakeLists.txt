@@ -22,14 +22,12 @@ add_library(glad STATIC
 )
 target_include_directories(glad PUBLIC deps/glad/include)
 
-# Add libsoundio as subdirectory
-add_subdirectory(deps/libsoundio)
-include_directories(${CMAKE_SOURCE_DIR}/deps/libsoundio)
-
 # Find required libraries
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SNDFILE REQUIRED sndfile)
 pkg_check_modules(FFTW3F REQUIRED fftw3f)
+pkg_check_modules(PIPEWIRE REQUIRED libpipewire-0.3)
+pkg_check_modules(SPA REQUIRED libspa-0.2)
 
 # Create shared library for mel spectrogram generation
 add_library(melspec SHARED
@@ -50,11 +48,13 @@ add_library(audio_stream SHARED
 )
 target_include_directories(audio_stream PUBLIC
     ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_SOURCE_DIR}/deps/libsoundio
+    ${PIPEWIRE_INCLUDE_DIRS}
+    ${SPA_INCLUDE_DIRS}
 )
 target_link_libraries(audio_stream
     melspec
-    libsoundio_shared
+    ${PIPEWIRE_LIBRARIES}
+    ${SPA_LIBRARIES}
     m
     pthread
 )

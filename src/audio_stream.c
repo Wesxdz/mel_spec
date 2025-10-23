@@ -7,8 +7,9 @@
 #include <unistd.h>
 #include <time.h>
 #include <math.h>
-#include <soundio/soundio.h>
-#include <strings.h>
+#include <pipewire/pipewire.h>
+#include <spa/param/audio/format-utils.h>
+#include <spa/param/props.h>
 
 #define BUFFER_DURATION 2.0f
 #define ROLLING_WINDOW_DURATION 5.0f
@@ -36,10 +37,11 @@ struct AudioStreamContext {
     AudioFrameCallback callback;
     void* user_data;
 
-    // libsoundio objects
-    struct SoundIo *soundio;
-    struct SoundIoDevice *device;
-    struct SoundIoInStream *instream;
+    // pipewire objects
+    struct pw_thread_loop *loop;
+    struct pw_stream *stream;
+    struct spa_hook stream_listener;
+    int n_channels;
 
     int frame_counter;
 };
@@ -118,65 +120,91 @@ static void circular_buffer_write(CircularBuffer *cb, const float *data, int cou
     pthread_mutex_unlock(&cb->mutex);
 }
 
-// libsoundio read callback
-static void read_callback(struct SoundIoInStream *instream, int frame_count_min, int frame_count_max) {
-    struct SoundIoChannelArea *areas;
-    int err;
-    AudioStreamContext *ctx = (AudioStreamContext*)instream->userdata;
+// pipewire stream process callback
+static void on_stream_process(void *userdata) {
+    AudioStreamContext *ctx = (AudioStreamContext*)userdata;
+    struct pw_buffer *b;
+    struct spa_buffer *buf;
+    float *samples;
+    uint32_t n_samples;
 
-    int frames_left = frame_count_max;
+    if ((b = pw_stream_dequeue_buffer(ctx->stream)) == NULL) {
+        fprintf(stderr, "out of buffers\n");
+        return;
+    }
 
-    while (frames_left > 0) {
-        int frame_count = frames_left;
+    buf = b->buffer;
+    if (buf->datas[0].data == NULL || buf->datas[0].chunk->size == 0) {
+        pw_stream_queue_buffer(ctx->stream, b);
+        return;
+    }
 
-        if ((err = soundio_instream_begin_read(instream, &areas, &frame_count))) {
-            fprintf(stderr, "Error reading from stream: %s\n", soundio_strerror(err));
-            return;
+    samples = buf->datas[0].data;
+    n_samples = buf->datas[0].chunk->size / sizeof(float);
+
+    // Convert multi-channel to mono if needed
+    int channels = ctx->n_channels;
+    if (channels <= 0) channels = 2; // Default to stereo
+
+    int frames = n_samples / channels;
+
+    if (frames > ctx->audio_conversion_buffer_size) {
+        frames = ctx->audio_conversion_buffer_size;
+    }
+
+    for (int frame = 0; frame < frames; frame++) {
+        float sample = 0.0f;
+
+        // Average all channels to mono
+        for (int ch = 0; ch < channels; ch++) {
+            sample += samples[frame * channels + ch];
         }
+        sample /= channels;
 
-        if (!frame_count)
-            break;
+        ctx->audio_conversion_buffer[frame] = sample;
+    }
 
-        if (!areas) {
-            // Silence
-            frames_left -= frame_count;
-        } else {
-            // Use pre-allocated buffer (NO malloc in real-time callback!)
-            if (frame_count > ctx->audio_conversion_buffer_size) {
-                fprintf(stderr, "Warning: frame_count %d exceeds buffer size %d\n",
-                        frame_count, ctx->audio_conversion_buffer_size);
-                frame_count = ctx->audio_conversion_buffer_size;
-            }
+    circular_buffer_write(&ctx->buffer, ctx->audio_conversion_buffer, frames);
 
-            for (int frame = 0; frame < frame_count; frame++) {
-                float sample = 0.0f;
+    pw_stream_queue_buffer(ctx->stream, b);
+}
 
-                // Average all channels to mono
-                for (int ch = 0; ch < instream->layout.channel_count; ch++) {
-                    float *ptr = (float*)(areas[ch].ptr + areas[ch].step * frame);
-                    sample += *ptr;
-                }
-                sample /= instream->layout.channel_count;
+// pipewire stream param changed callback
+static void on_stream_param_changed(void *userdata, uint32_t id, const struct spa_pod *param) {
+    AudioStreamContext *ctx = (AudioStreamContext*)userdata;
 
-                ctx->audio_conversion_buffer[frame] = sample;
-            }
+    if (param == NULL || id != SPA_PARAM_Format)
+        return;
 
-            circular_buffer_write(&ctx->buffer, ctx->audio_conversion_buffer, frame_count);
+    struct spa_audio_info_raw info = { 0 };
+    if (spa_format_audio_raw_parse(param, &info) < 0)
+        return;
 
-            frames_left -= frame_count;
-        }
+    ctx->n_channels = info.channels;
+    printf("Stream format: %d channels, %d Hz\n", info.channels, info.rate);
+}
 
-        if ((err = soundio_instream_end_read(instream))) {
-            fprintf(stderr, "Error ending read: %s\n", soundio_strerror(err));
-            return;
-        }
+// pipewire stream state changed callback
+static void on_stream_state_changed(void *userdata, enum pw_stream_state old,
+                                    enum pw_stream_state state, const char *error) {
+    AudioStreamContext *ctx = (AudioStreamContext*)userdata;
+    printf("Stream state changed: %s -> %s\n",
+           pw_stream_state_as_string(old),
+           pw_stream_state_as_string(state));
+
+    if (state == PW_STREAM_STATE_ERROR) {
+        fprintf(stderr, "Stream error: %s\n", error);
+        ctx->running = 0;
     }
 }
 
-static void overflow_callback(struct SoundIoInStream *instream) {
-    static int count = 0;
-    fprintf(stderr, "Overflow %d\n", ++count);
-}
+// pipewire stream events
+static const struct pw_stream_events stream_events = {
+    PW_VERSION_STREAM_EVENTS,
+    .process = on_stream_process,
+    .state_changed = on_stream_state_changed,
+    .param_changed = on_stream_param_changed,
+};
 
 // Streaming spectrogram processing thread
 // RUNS IN WORKER THREAD - All mel spectrogram generation happens here
@@ -363,82 +391,6 @@ static void *streaming_spectrogram_thread(void *arg) {
     return NULL;
 }
 
-// Find a loopback/monitor device for system audio capture
-// Prioritizes the monitor source for the default output device
-static int find_loopback_device(struct SoundIo *soundio) {
-    int input_count = soundio_input_device_count(soundio);
-
-    printf("Searching for system audio loopback device...\n");
-
-    // First, try to find the default output device to get its monitor
-    int default_output_index = soundio_default_output_device_index(soundio);
-    if (default_output_index >= 0) {
-        struct SoundIoDevice *output_device = soundio_get_output_device(soundio, default_output_index);
-        if (output_device) {
-            printf("Default output device: %s\n", output_device->name);
-            printf("Searching for corresponding monitor source...\n");
-
-            // Look for a monitor device that matches the output device
-            // Common patterns:
-            // - PulseAudio/PipeWire: "device_name.monitor"
-            // - Some systems: "Monitor of device_name"
-            for (int i = 0; i < input_count; i++) {
-                struct SoundIoDevice *input_device = soundio_get_input_device(soundio, i);
-                if (!input_device) continue;
-
-                // Check if this monitor corresponds to the default output
-                if (strcasestr(input_device->name, output_device->name) != NULL &&
-                    strcasestr(input_device->name, "monitor") != NULL) {
-                    printf("Found matching monitor for default output: %s\n", input_device->name);
-                    int index = i;
-                    soundio_device_unref(input_device);
-                    soundio_device_unref(output_device);
-                    return index;
-                }
-
-                soundio_device_unref(input_device);
-            }
-
-            soundio_device_unref(output_device);
-            printf("No monitor found for default output, searching for any monitor device...\n");
-        }
-    }
-
-    // Fallback: search for any loopback/monitor device
-    const char *loopback_keywords[] = {
-        "monitor",
-        "loopback",
-        "Stereo Mix",
-        "Wave Out",
-        "What U Hear",
-        "Rec. Playback"
-    };
-    int num_keywords = sizeof(loopback_keywords) / sizeof(loopback_keywords[0]);
-
-    printf("Available input devices:\n");
-
-    for (int i = 0; i < input_count; i++) {
-        struct SoundIoDevice *device = soundio_get_input_device(soundio, i);
-        if (!device) continue;
-
-        printf("  [%d] %s\n", i, device->name);
-
-        // Check if device name contains any loopback keywords (case-insensitive)
-        for (int k = 0; k < num_keywords; k++) {
-            if (strcasestr(device->name, loopback_keywords[k]) != NULL) {
-                printf("Found loopback device: %s\n", device->name);
-                int index = i;
-                soundio_device_unref(device);
-                return index;
-            }
-        }
-
-        soundio_device_unref(device);
-    }
-
-    return -1;
-}
-
 // Initialize audio stream context
 AudioStreamContext* audio_stream_init(int use_system_audio,
                                       AudioFrameCallback callback,
@@ -452,6 +404,7 @@ AudioStreamContext* audio_stream_init(int use_system_audio,
     ctx->sample_rate = MELSPEC_SR;
     ctx->running = 0;
     ctx->frame_counter = 0;
+    ctx->n_channels = 2;  // Default to stereo, will be updated by param_changed
 
     // Initialize circular buffer
     int buffer_size = (int)(MELSPEC_SR * BUFFER_DURATION);
@@ -473,77 +426,86 @@ AudioStreamContext* audio_stream_init(int use_system_audio,
 int audio_stream_start(AudioStreamContext* ctx) {
     if (!ctx) return -1;
 
-    ctx->soundio = soundio_create();
-    if (!ctx->soundio) {
-        fprintf(stderr, "Error: Out of memory\n");
+    // Initialize pipewire
+    pw_init(NULL, NULL);
+
+    // Create thread loop
+    ctx->loop = pw_thread_loop_new("audio-capture", NULL);
+    if (!ctx->loop) {
+        fprintf(stderr, "Failed to create pipewire thread loop\n");
         return -1;
     }
 
-    int err = soundio_connect(ctx->soundio);
-    if (err) {
-        fprintf(stderr, "Error connecting: %s\n", soundio_strerror(err));
-        soundio_destroy(ctx->soundio);
-        ctx->soundio = NULL;
-        return -1;
-    }
+    // Create stream
+    struct pw_properties *props = pw_properties_new(
+        PW_KEY_MEDIA_TYPE, "Audio",
+        PW_KEY_MEDIA_CATEGORY, "Capture",
+        PW_KEY_MEDIA_ROLE, "Music",
+        NULL
+    );
 
-    soundio_flush_events(ctx->soundio);
-
-    int device_index;
-
+    // Set target for system audio or microphone
     if (ctx->use_system_audio) {
-        device_index = find_loopback_device(ctx->soundio);
-        if (device_index < 0) {
-            fprintf(stderr, "Error: No system audio loopback device found\n");
-            soundio_destroy(ctx->soundio);
-            ctx->soundio = NULL;
-            return -1;
-        }
+        // Connect to system audio monitor/loopback
+        // PW_KEY_STREAM_CAPTURE_SINK tells pipewire to capture from the sink monitor
+        pw_properties_set(props, PW_KEY_STREAM_CAPTURE_SINK, "true");
+        printf("Requesting system audio loopback...\n");
     } else {
-        device_index = soundio_default_input_device_index(ctx->soundio);
-        if (device_index < 0) {
-            fprintf(stderr, "Error: No input device found\n");
-            soundio_destroy(ctx->soundio);
-            ctx->soundio = NULL;
-            return -1;
-        }
+        // Connect to default microphone - no special properties needed
+        printf("Requesting microphone input...\n");
     }
 
-    ctx->device = soundio_get_input_device(ctx->soundio, device_index);
-    if (!ctx->device) {
-        fprintf(stderr, "Error: Out of memory\n");
-        soundio_destroy(ctx->soundio);
-        ctx->soundio = NULL;
+    ctx->stream = pw_stream_new_simple(
+        pw_thread_loop_get_loop(ctx->loop),
+        "audio-capture",
+        props,
+        &stream_events,
+        ctx
+    );
+
+    if (!ctx->stream) {
+        fprintf(stderr, "Failed to create pipewire stream\n");
+        pw_thread_loop_destroy(ctx->loop);
+        ctx->loop = NULL;
         return -1;
     }
 
-    printf("Using input device: %s\n", ctx->device->name);
+    // Configure audio format
+    uint8_t buffer[1024];
+    struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
 
-    ctx->instream = soundio_instream_create(ctx->device);
-    if (!ctx->instream) {
-        fprintf(stderr, "Error: Out of memory\n");
-        soundio_device_unref(ctx->device);
-        soundio_destroy(ctx->soundio);
-        ctx->device = NULL;
-        ctx->soundio = NULL;
+    const struct spa_pod *params[1];
+    struct spa_audio_info_raw audio_info = {
+        .format = SPA_AUDIO_FORMAT_F32,
+        .rate = MELSPEC_SR,
+        .channels = 2,  // Request stereo, we'll convert to mono
+    };
+
+    params[0] = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat, &audio_info);
+
+    // Connect stream
+    if (pw_stream_connect(ctx->stream,
+                         PW_DIRECTION_INPUT,
+                         PW_ID_ANY,
+                         PW_STREAM_FLAG_AUTOCONNECT |
+                         PW_STREAM_FLAG_MAP_BUFFERS |
+                         PW_STREAM_FLAG_RT_PROCESS,
+                         params, 1) < 0) {
+        fprintf(stderr, "Failed to connect pipewire stream\n");
+        pw_stream_destroy(ctx->stream);
+        pw_thread_loop_destroy(ctx->loop);
+        ctx->stream = NULL;
+        ctx->loop = NULL;
         return -1;
     }
 
-    ctx->instream->format = SoundIoFormatFloat32NE;
-    ctx->instream->sample_rate = MELSPEC_SR;
-    ctx->instream->read_callback = read_callback;
-    ctx->instream->overflow_callback = overflow_callback;
-    ctx->instream->software_latency = 0.01;
-    ctx->instream->userdata = ctx;
-
-    if ((err = soundio_instream_open(ctx->instream))) {
-        fprintf(stderr, "Error opening stream: %s\n", soundio_strerror(err));
-        soundio_instream_destroy(ctx->instream);
-        soundio_device_unref(ctx->device);
-        soundio_destroy(ctx->soundio);
-        ctx->instream = NULL;
-        ctx->device = NULL;
-        ctx->soundio = NULL;
+    // Start the thread loop
+    if (pw_thread_loop_start(ctx->loop) < 0) {
+        fprintf(stderr, "Failed to start pipewire thread loop\n");
+        pw_stream_destroy(ctx->stream);
+        pw_thread_loop_destroy(ctx->loop);
+        ctx->stream = NULL;
+        ctx->loop = NULL;
         return -1;
     }
 
@@ -552,20 +514,12 @@ int audio_stream_start(AudioStreamContext* ctx) {
     // Start processing thread
     pthread_create(&ctx->processing_thread, NULL, streaming_spectrogram_thread, ctx);
 
-    if ((err = soundio_instream_start(ctx->instream))) {
-        fprintf(stderr, "Error starting stream: %s\n", soundio_strerror(err));
-        ctx->running = 0;
-        pthread_join(ctx->processing_thread, NULL);
-        soundio_instream_destroy(ctx->instream);
-        soundio_device_unref(ctx->device);
-        soundio_destroy(ctx->soundio);
-        ctx->instream = NULL;
-        ctx->device = NULL;
-        ctx->soundio = NULL;
-        return -1;
+    if (ctx->use_system_audio) {
+        printf("Capturing system audio...\n");
+    } else {
+        printf("Recording from microphone...\n");
     }
 
-    printf("Recording from microphone...\n");
     return 0;
 }
 
@@ -578,17 +532,18 @@ void audio_stream_stop(AudioStreamContext* ctx) {
         pthread_join(ctx->processing_thread, NULL);
     }
 
-    if (ctx->instream) {
-        soundio_instream_destroy(ctx->instream);
-        ctx->instream = NULL;
+    if (ctx->loop) {
+        pw_thread_loop_stop(ctx->loop);
     }
-    if (ctx->device) {
-        soundio_device_unref(ctx->device);
-        ctx->device = NULL;
+
+    if (ctx->stream) {
+        pw_stream_destroy(ctx->stream);
+        ctx->stream = NULL;
     }
-    if (ctx->soundio) {
-        soundio_destroy(ctx->soundio);
-        ctx->soundio = NULL;
+
+    if (ctx->loop) {
+        pw_thread_loop_destroy(ctx->loop);
+        ctx->loop = NULL;
     }
 }
 
