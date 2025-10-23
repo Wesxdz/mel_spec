@@ -31,21 +31,46 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(SNDFILE REQUIRED sndfile)
 pkg_check_modules(FFTW3F REQUIRED fftw3f)
 
-# Create executable (compile .c as C++ for fpng compatibility)
+# Create shared library for mel spectrogram generation
+add_library(melspec SHARED
+    src/melspec.c
+)
+target_include_directories(melspec PUBLIC
+    ${CMAKE_SOURCE_DIR}/src
+    ${FFTW3F_INCLUDE_DIRS}
+)
+target_link_libraries(melspec
+    ${FFTW3F_LIBRARIES}
+    m
+)
+
+# Create shared library for audio streaming
+add_library(audio_stream SHARED
+    src/audio_stream.c
+)
+target_include_directories(audio_stream PUBLIC
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/deps/libsoundio
+)
+target_link_libraries(audio_stream
+    melspec
+    libsoundio_shared
+    m
+    pthread
+)
+
+# Create executable
 add_executable(spec_hud
     src/spec_hud.c
-    deps/fpng/src/fpng.cpp
 )
-set_source_files_properties(src/spec_hud.c PROPERTIES LANGUAGE CXX)
 
 # Link libraries
-target_include_directories(spec_hud PRIVATE ${SNDFILE_INCLUDE_DIRS} ${FFTW3F_INCLUDE_DIRS})
+target_include_directories(spec_hud PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+)
 target_link_libraries(spec_hud
-    ${SNDFILE_LIBRARIES}
-    ${FFTW3F_LIBRARIES}
-    libsoundio_shared
+    audio_stream
     glfw
     glad
-    m
     pthread
 )
