@@ -364,9 +364,47 @@ static void *streaming_spectrogram_thread(void *arg) {
 }
 
 // Find a loopback/monitor device for system audio capture
+// Prioritizes the monitor source for the default output device
 static int find_loopback_device(struct SoundIo *soundio) {
     int input_count = soundio_input_device_count(soundio);
 
+    printf("Searching for system audio loopback device...\n");
+
+    // First, try to find the default output device to get its monitor
+    int default_output_index = soundio_default_output_device_index(soundio);
+    if (default_output_index >= 0) {
+        struct SoundIoDevice *output_device = soundio_get_output_device(soundio, default_output_index);
+        if (output_device) {
+            printf("Default output device: %s\n", output_device->name);
+            printf("Searching for corresponding monitor source...\n");
+
+            // Look for a monitor device that matches the output device
+            // Common patterns:
+            // - PulseAudio/PipeWire: "device_name.monitor"
+            // - Some systems: "Monitor of device_name"
+            for (int i = 0; i < input_count; i++) {
+                struct SoundIoDevice *input_device = soundio_get_input_device(soundio, i);
+                if (!input_device) continue;
+
+                // Check if this monitor corresponds to the default output
+                if (strcasestr(input_device->name, output_device->name) != NULL &&
+                    strcasestr(input_device->name, "monitor") != NULL) {
+                    printf("Found matching monitor for default output: %s\n", input_device->name);
+                    int index = i;
+                    soundio_device_unref(input_device);
+                    soundio_device_unref(output_device);
+                    return index;
+                }
+
+                soundio_device_unref(input_device);
+            }
+
+            soundio_device_unref(output_device);
+            printf("No monitor found for default output, searching for any monitor device...\n");
+        }
+    }
+
+    // Fallback: search for any loopback/monitor device
     const char *loopback_keywords[] = {
         "monitor",
         "loopback",
@@ -377,7 +415,6 @@ static int find_loopback_device(struct SoundIo *soundio) {
     };
     int num_keywords = sizeof(loopback_keywords) / sizeof(loopback_keywords[0]);
 
-    printf("Searching for system audio loopback device...\n");
     printf("Available input devices:\n");
 
     for (int i = 0; i < input_count; i++) {
